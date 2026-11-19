@@ -373,6 +373,8 @@ Fases: 1 → 2 → 3 → 4, em sequência. Dentro de cada fase, as tarefas segue
   - `test_timeout_efetivo_registrado_em_m1_e_aplicado_ao_executor`;
   - `test_executor_que_ultrapassa_o_timeout_nao_e_execucao_normal`, `test_timeout_nao_assume_que_cancelar_desfaz_efeitos`, `test_resultado_tardio_e_descartado_e_nao_altera_o_actionlog` e `test_timeout_rigido_nao_depende_da_cooperacao_do_executor`;
   - `test_falha_do_executor_preserva_reason_da_autorizacao` e `test_autorizacao_permitida_comeca_com_result_unknown`;
+  - **anti-bypass e caminho de produção:** `test_run_step_nao_executa_authorization_step_fabricado`, `test_selo_forjado_ou_copiado_nao_executa`, `test_passo_negado_adulterado_para_permitido_nao_executa`, `test_passo_legitimo_nao_autoriza_outro_payload_nem_outro_alvo_nem_outro_contexto`, `test_aprovacao_substituida_por_outra_com_o_mesmo_id_e_atributos_diferentes_e_rejeitada` (9 variações), `test_payload_da_aprovacao_mutado_no_lugar_entre_autorizar_e_executar_e_rejeitado`, `test_aprovacao_removida_ou_inserida_apos_a_autorizacao_e_rejeitada` e `test_nenhum_caminho_de_producao_executa_acoes_sem_execute_and_record` (varredura de `app/`);
+  - **timeout e `unknown`:** `test_aprovacao_e_consumida_quando_o_resultado_e_unknown`, `test_falha_conhecida_continua_como_no_ap13_nao_consome`, `test_nova_tentativa_igual_e_negada_enquanto_o_trabalho_abandonado_roda`;
   - `test_acao_sem_timeout_grava_negacao_e_nao_chama_executor` e `test_executor_sem_timeout_configurado_e_recusado`;
   - `test_queda_apos_autorizacao_deixa_linha_sem_conclusao`;
   - `test_conciliacao_respeita_timeout_mais_2_minutos`;
