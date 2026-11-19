@@ -285,3 +285,17 @@ def test_falha_conhecida_continua_como_no_ap13_nao_consome():
     )
     assert sink.rows[1].result == "error"
     assert result.approval.used_at is None
+
+
+def test_executor_do_execute_and_record_recebe_o_snapshot_mesmo_com_mutacao_do_chamador():
+    payload = {"texto": "projeto A", "tags": ["a"]}
+    pedido = ActionRequest("llm.evaluate", "opp-snapshot", payload)
+
+    def muta_o_original():
+        payload["texto"] = "ADULTERADO"
+        payload["tags"].append("injetado")
+
+    ex = FakeExecutor(on_call=muta_o_original)
+    run(ex, request=pedido)
+    assert payload["texto"] == "ADULTERADO"  # a mutação concorrente aconteceu
+    assert ex.calls[0]["payload"] == {"texto": "projeto A", "tags": ["a"]}

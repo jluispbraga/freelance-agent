@@ -16,8 +16,13 @@ timeout nem registro; nenhum código de produção pode chamá-lo (há teste de 
 `authorize_step`. O passo carrega um selo HMAC-SHA256 cuja chave é gerada por processo, vive só
 dentro de um *closure* deste módulo e nunca sai dele. Congelar a dataclass impede alterar um passo
 legítimo, mas não impede **fabricar** um; o selo impede as duas coisas, e vincula o passo ao pedido
-(ação, alvo, hash do payload), ao contexto (`ctx.now`), ao **estado completo da aprovação** usada
-(não só o `id`) e a todos os campos da decisão e da entrada.
+(ação, alvo, hash e snapshot do payload), ao contexto (`ctx.now`), ao **estado completo da
+aprovação** usada (não só o `id`) e a todos os campos da decisão e da entrada.
+
+**Snapshot do payload.** `authorize_step` lê o payload do chamador **uma única vez**, em JSON
+canônico, e dele saem o hash, a avaliação da política e o conteúdo entregue ao executor. O
+`dict` do chamador é mutável mesmo dentro de uma `ActionRequest` congelada; por isso o executor
+nunca o recebe: `run_step` entrega uma cópia nova do snapshot autorizado.
 """
 
 import dataclasses
@@ -29,7 +34,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.actions.approval import ApprovalRecord, content_hash, mark_used
+from app.actions.approval import ApprovalRecord, canonical_json, content_hash, mark_used
 from app.actions.audit import AuditEntry
 from app.actions.policy import ActionRequest, Context, Decision, authorize
 from app.actions.registry import REGISTRY, ActionSpec, Level
@@ -76,6 +81,9 @@ class AuthorizationStep:
     approval_id: str | None
     correlation_id: str | None = None
     timeout_ms: int | None = None
+    # Snapshot canônico e imutável (bytes) do payload AUTORIZADO. O executor recebe uma cópia
+    # nova obtida daqui, nunca a referência mutável do chamador.
+    payload_canonical: bytes = field(default=b"", repr=False, compare=False)
     seal: str = field(default="", repr=False, compare=False)
 
 
@@ -113,6 +121,7 @@ def _seal_fields(step: AuthorizationStep, request: ActionRequest, ctx: Context) 
         request.action,
         request.target,
         step.payload_hash,
+        hashlib.sha256(step.payload_canonical).hexdigest(),
         step.approval_id,
         _approval_fingerprint(ctx.approval),
         step.correlation_id,
@@ -174,12 +183,18 @@ def authorize_step(
     """
     approval_id = ctx.approval.id if ctx.approval is not None else None
     try:
-        payload_hash = content_hash(request.payload)
+        # ÚNICA leitura do payload do chamador: tudo (hash, política, execução) usa este snapshot.
+        canonical = canonical_json(request.payload)
     except (TypeError, ValueError):
+        canonical = b""
         payload_hash = "nao_serializavel"
         decision = Decision(request.action, False, "payload_nao_serializavel")
     else:
-        decision = authorize(request, ctx, registry)
+        payload_hash = hashlib.sha256(canonical).hexdigest()
+        snapshot = ActionRequest(
+            request.action, request.target, json.loads(canonical), request.trigger
+        )
+        decision = authorize(snapshot, ctx, registry)  # a política avalia o que será executado
 
     entry = AuditEntry(
         event="authorization",
@@ -195,7 +210,13 @@ def authorize_step(
         timeout_ms=timeout_ms if decision.allowed else None,
     )
     unsealed = AuthorizationStep(
-        decision, entry, payload_hash, approval_id, correlation_id, entry.timeout_ms
+        decision,
+        entry,
+        payload_hash,
+        approval_id,
+        correlation_id,
+        entry.timeout_ms,
+        payload_canonical=canonical,
     )
     return AuthorizationStep(
         decision,
@@ -204,6 +225,7 @@ def authorize_step(
         approval_id,
         correlation_id,
         entry.timeout_ms,
+        payload_canonical=canonical,
         seal=_sign(_seal_fields(unsealed, request, ctx)),
     )
 
@@ -214,8 +236,12 @@ def _check_step(step: AuthorizationStep, request: ActionRequest, ctx: Context) -
         _seal_fields(step, request, ctx), step.seal
     ):
         raise InvalidAuthorizationStep("passo de autorização inválido, adulterado ou fabricado")
-    if step.decision.allowed and content_hash(request.payload) != step.payload_hash:
-        raise InvalidAuthorizationStep("o payload não é o que foi autorizado")
+    if step.decision.allowed:
+        if hashlib.sha256(step.payload_canonical).hexdigest() != step.payload_hash:
+            raise InvalidAuthorizationStep("snapshot do payload não corresponde ao autorizado")
+        if content_hash(request.payload) != step.payload_hash:
+            # o chamador mudou o payload depois da autorização: falha fechada
+            raise InvalidAuthorizationStep("o payload não é o que foi autorizado")
 
 
 def run_step(
@@ -227,19 +253,23 @@ def run_step(
     """Passo **não puro**: chama o executor, que pode produzir efeitos externos.
 
     Verifica o selo **antes de qualquer coisa**: um passo fabricado nunca chega ao executor
-    (`InvalidAuthorizationStep`). Executa só se a autorização permitiu; um passo negado nunca
-    chama o executor. Não grava, não gera identificadores e não impõe o timeout
-    (responsabilidade de `persistence.py`). Uma exceção do executor vira `decision="error"` em
-    memória, com o nome do tipo em `reason`; a persistência traduz isso (`result=error`,
-    `error=<tipo>`, `reason` preservando o da autorização).
+    (`InvalidAuthorizationStep`). O executor recebe exclusivamente o **snapshot canônico** do
+    payload autorizado (cópia independente), cujo hash é o validado e auditado. Executa só se a
+    autorização permitiu; um passo negado nunca chama o executor. Não grava, não gera
+    identificadores e não impõe o timeout (responsabilidade de `persistence.py`). Uma exceção do
+    executor vira `decision="error"` em memória, com o nome do tipo em `reason`; a persistência
+    traduz isso (`result=error`, `error=<tipo>`, `reason` preservando o da autorização).
     """
     _check_step(step, request, ctx)
     decision = step.decision
     if not decision.allowed:
         return ExecutionResult(decision, ctx.approval, (step.entry,))
 
+    # O executor recebe uma cópia NOVA do snapshot autorizado, nunca `request.payload`: mutações
+    # do dict do chamador (inclusive concorrentes, depois da verificação acima) não o alcançam.
+    payload = json.loads(step.payload_canonical)
     try:
-        result = executor(request.payload)
+        result = executor(payload)
     except Exception as exc:  # o erro é registrado só pelo tipo, sem conteúdo
         error = type(exc).__name__
         return ExecutionResult(
