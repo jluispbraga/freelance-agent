@@ -33,6 +33,9 @@ SEGURANCA_CONTROLADA = (
     "app/actions/gateway.py",
     "app/actions/audit.py",
     "app/actions/authorization_md.py",
+    # Persistência e modelo do ActionLog: registram e armazenam as decisões (ADR-006).
+    "app/actions/persistence.py",
+    "app/models/actions.py",
     "app/migrations/0001_roles.py",
     "docker/db/init-roles.sql",
     "docker-compose.yml",

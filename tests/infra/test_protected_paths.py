@@ -160,6 +160,16 @@ def test_o_proprio_portao_e_seus_testes_sao_seguranca_controlada():
     assert len(controlados) == 3
 
 
+def test_persistencia_e_modelo_do_actionlog_sao_seguranca_controlada():
+    """Quem registra e armazena as decisões de autorização está sob o mesmo controle do gateway."""
+    modulo = _carregar_script()
+    protegidos, controlados = modulo.classificar(
+        ["app/actions/persistence.py", "app/models/actions.py", "app/services/algo.py"]
+    )
+    assert protegidos == []
+    assert controlados == ["app/actions/persistence.py", "app/models/actions.py"]
+
+
 def test_intervalo_com_tres_pontos_usa_a_base_comum(tmp_path):
     """`base...head` lista só o que o PR mudou, não o que entrou na base depois."""
     _repo_base(tmp_path, "LEIAME.txt")
