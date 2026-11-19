@@ -39,7 +39,7 @@ Defesa em camadas (design §5.8), mais as decisões do usuário de 19/11/2026.
 
 Design §6 (`id`, `created_at`, `action`, `target`, `payload_hash`, `decision`, `reason`, `approval_id`, `result`, `duration_ms`, `error`, `prev_hash`, `row_hash`) **mais**:
 - `event` (decisão do usuário): preserva os eventos que o `AuditEntry` já tem: `created`, `callback`, `expired`, `superseded`, `authorization`, `executed`.
-- `timeout_ms` (inteiro, **aprovado em 19/11/2026**; ver ADR-001 decisão 9): timeout efetivamente utilizado, gravado na linha de M1 quando a autorização é `allowed`; nulo nas demais linhas. `CHECK` garante que uma linha `authorization`/`allowed` sempre o tenha. A conciliação usa este valor, nunca a configuração atual.
+- `timeout_ms` (inteiro, **aprovado em 19/11/2026**; ver ADR-001 decisão 9): timeout efetivamente utilizado, gravado na linha de M1 quando a autorização é `allowed` e **copiado para as linhas `executed` e `reconciled` da mesma tentativa** (a linha de timeout carrega o valor de M1); nulo nas autorizações negadas. `CHECK` garante que uma linha `authorization`/`allowed` sempre o tenha. A conciliação usa este valor, nunca a configuração atual.
 - `correlation_id` (UUID, **aprovado**; ver ADR-001 decisão 9): gerado por tentativa de execução, persistido em M1 antes do executor, **com índice e sem unicidade**.
 - `chain_version` (smallint): versão do protocolo de hash da linha (decisão 9).
 - Evento novo `reconciled` (**aprovado**, decisão 10).
