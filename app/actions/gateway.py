@@ -16,8 +16,16 @@ timeout nem registro; nenhum código de produção pode chamá-lo (há teste de 
 `authorize_step`. O passo carrega um selo HMAC-SHA256 cuja chave é gerada por processo, vive só
 dentro de um *closure* deste módulo e nunca sai dele. Congelar a dataclass impede alterar um passo
 legítimo, mas não impede **fabricar** um; o selo impede as duas coisas, e vincula o passo ao pedido
-(ação, alvo, hash e snapshot do payload), ao contexto (`ctx.now`), ao **estado completo da
-aprovação** usada (não só o `id`) e a todos os campos da decisão e da entrada.
+(ação, alvo, `trigger`, hash e snapshot do payload), ao **contexto de política completo**
+(`ctx.now`, `owner`, `sources`, `granted_scopes`, `budget_reserved`, `sandboxed` e qualquer campo
+futuro do `Context`), ao **estado completo da aprovação** usada (não só o `id`) e a todos os
+campos da decisão e da entrada. Qualquer divergência entre o que produziu a autorização e o que
+chega à execução é recusada.
+
+**Limitação documentada: replay.** O passo **não é de uso único**: o gateway, isoladamente, não
+impede executar o mesmo `AuthorizationStep` duas vezes. Em produção quem garante isso é
+`persistence.execute_and_record`, que cria o passo internamente, não o expõe e o executa uma única
+vez; a proteção forte (reserva atômica entre chamadas concorrentes) é a pendência P-001.10.
 
 **Snapshot do payload.** `authorize_step` lê o payload do chamador **uma única vez**, em JSON
 canônico, e dele saem o hash, a avaliação da política e o conteúdo entregue ao executor. O
@@ -32,6 +40,7 @@ import json
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from app.actions.approval import ApprovalRecord, canonical_json, content_hash, mark_used
@@ -115,11 +124,43 @@ def _approval_fingerprint(approval: Any) -> Any:
     return campos
 
 
+def _canon(valor: Any) -> Any:
+    """Forma canônica (JSON-serializável e determinística) de um valor de política."""
+    if valor is None or isinstance(valor, bool | int | float | str):
+        return valor
+    if hasattr(valor, "isoformat"):
+        return valor.isoformat()
+    if isinstance(valor, Enum):
+        return valor.value
+    if dataclasses.is_dataclass(valor) and not isinstance(valor, type):
+        return {f.name: _canon(getattr(valor, f.name)) for f in dataclasses.fields(valor)}
+    if isinstance(valor, Mapping):
+        return {str(k): _canon(v) for k, v in valor.items()}
+    if isinstance(valor, set | frozenset):
+        return sorted((_canon(v) for v in valor), key=lambda v: json.dumps(v, sort_keys=True))
+    if isinstance(valor, list | tuple):
+        return [_canon(v) for v in valor]
+    return ["opaco", type(valor).__qualname__, repr(valor)]
+
+
+def _context_fingerprint(ctx: Context) -> dict[str, Any]:
+    """TODOS os campos do `Context` que influenciam a política, exceto a aprovação (que tem
+    impressão própria). Percorre `dataclasses.fields`, então um campo novo do `Context` entra no
+    selo automaticamente: não depende de alguém lembrar de acrescentá-lo aqui."""
+    return {
+        f.name: _canon(getattr(ctx, f.name))
+        for f in dataclasses.fields(ctx)
+        if f.name != "approval"
+    }
+
+
 def _seal_fields(step: AuthorizationStep, request: ActionRequest, ctx: Context) -> list[Any]:
     d, e = step.decision, step.entry
     return [
         request.action,
         request.target,
+        request.trigger,
+        _context_fingerprint(ctx),
         step.payload_hash,
         hashlib.sha256(step.payload_canonical).hexdigest(),
         step.approval_id,

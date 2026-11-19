@@ -17,7 +17,7 @@ from app.actions.gateway import (
     execute,
     run_step,
 )
-from app.actions.policy import ActionRequest, Decision
+from app.actions.policy import ActionRequest, Context, Decision, Owner, SourceState
 from app.actions.registry import REGISTRY, ActionSpec, Level
 from tests.actions.conftest import NOW, OWNER, make_context
 
@@ -348,3 +348,108 @@ def test_destinatario_e_decidido_sobre_o_snapshot_da_autorizacao():
     ctx = make_context()
     assert authorize_step(autorizado, ctx).decision.allowed
     assert authorize_step(negado, ctx).decision.reason == "destinatario_nao_e_o_dono"
+
+
+# --- vínculo do selo ao contexto de política COMPLETO e ao trigger --------------------------
+
+SEARCH_REGISTRY = MappingProxyType(
+    {
+        **REGISTRY,
+        "platform.search": ActionSpec(
+            "platform.search", Level.AUTO, ("Analisar oportunidades",), has_executor=True
+        ),
+    }
+)
+
+
+def test_trigger_divergente_entre_autorizacao_e_execucao_e_rejeitado():
+    """Autorizada com trigger=owner (fonte sob demanda); executada como trigger=system."""
+    pedido_dono = ActionRequest("platform.search", "q-1", {"source": "upwork"}, trigger="owner")
+    pedido_sistema = dataclasses.replace(pedido_dono, trigger="system")
+    ctx = make_context()
+    passo = authorize_step(pedido_dono, ctx, SEARCH_REGISTRY)
+    assert passo.decision.allowed
+    # a política negaria o mesmo pedido com trigger=system: o passo não pode valer para ele
+    assert authorize_step(pedido_sistema, ctx, SEARCH_REGISTRY).decision.reason == (
+        "fonte_somente_sob_demanda"
+    )
+    spy = Spy()
+    with pytest.raises(InvalidAuthorizationStep):
+        run_step(passo, pedido_sistema, ctx, spy)
+    assert spy.calls == []
+
+
+@pytest.mark.parametrize(
+    "campo,valor",
+    [
+        ("owner", Owner(user_id=111, chat_id=999)),
+        ("owner", Owner(user_id=999, chat_id=111)),
+        ("sources", {}),
+        ("sources", {"upwork": SourceState(compliance="pending", mode="on_demand")}),
+        ("sources", {"upwork": SourceState(compliance="approved", mode="scheduled")}),
+        ("granted_scopes", {}),
+        ("granted_scopes", {"upwork": frozenset({"jobs:write"})}),
+        ("budget_reserved", False),
+        ("sandboxed", True),
+        ("now", NOW + timedelta(seconds=1)),
+    ],
+)
+def test_contexto_divergente_entre_autorizacao_e_execucao_e_rejeitado(campo, valor):
+    ctx = make_context(budget_reserved=True)
+    passo = authorize_step(REQ, ctx)
+    assert passo.decision.allowed
+    adulterado = dataclasses.replace(ctx, **{campo: valor})
+    assert getattr(adulterado, campo) != getattr(ctx, campo)
+    spy = Spy()
+    with pytest.raises(InvalidAuthorizationStep):
+        run_step(passo, REQ, adulterado, spy)
+    assert spy.calls == []
+
+
+def test_o_selo_cobre_todos_os_campos_do_contexto():
+    """Se um campo for acrescentado ao `Context`, ele entra no selo sem ninguém lembrar."""
+    cobertos = set(gw._context_fingerprint(make_context()))
+    campos = {f.name for f in dataclasses.fields(Context)}
+    assert campos - {"approval"} <= cobertos  # a aprovação tem impressão própria (testes acima)
+
+
+def test_campo_novo_no_contexto_passa_a_valer_no_selo_automaticamente():
+    @dataclasses.dataclass(frozen=True)
+    class ContextoMaior(Context):
+        regra_futura: str = "a"
+
+    ctx = ContextoMaior(
+        now=NOW, owner=OWNER, sources={}, granted_scopes={}, budget_reserved=True, regra_futura="a"
+    )
+    passo = authorize_step(REQ, ctx)
+    spy = Spy()
+    with pytest.raises(InvalidAuthorizationStep):
+        run_step(passo, REQ, dataclasses.replace(ctx, regra_futura="b"), spy)
+    assert spy.calls == []
+    run_step(passo, REQ, ctx, spy)
+    assert len(spy.calls) == 1
+
+
+def test_o_selo_nao_depende_da_ordem_de_insercao_de_sources_nem_do_conteudo_dos_conjuntos():
+    a = SourceState(compliance="approved", mode="scheduled")
+    b = SourceState(compliance="approved", mode="on_demand")
+    ctx1 = make_context(budget_reserved=True, sources={"x": a, "y": b})
+    ctx2 = make_context(budget_reserved=True, sources={"y": b, "x": a})
+    passo = authorize_step(REQ, ctx1)
+    spy = Spy()
+    run_step(passo, REQ, ctx2, spy)  # mesmo conteúdo, ordem diferente: continua válido
+    assert len(spy.calls) == 1
+
+
+def test_gateway_isolado_nao_e_de_uso_unico_limitacao_documentada():
+    """LIMITAÇÃO DOCUMENTADA (replay): o gateway sozinho executa o mesmo passo mais de uma vez.
+    A proteção está em `persistence.execute_and_record` (passo interno, executado uma vez) e,
+    entre chamadas concorrentes, na reserva atômica pendente (P-001.10). Se um dia o passo virar
+    de uso único, este teste deve ser trocado por um que exija a recusa do replay."""
+    req = REQ
+    ctx = make_context(budget_reserved=True)
+    passo = authorize_step(req, ctx)
+    spy = Spy()
+    run_step(passo, req, ctx, spy)
+    run_step(passo, req, ctx, spy)
+    assert len(spy.calls) == 2

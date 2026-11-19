@@ -299,3 +299,11 @@ def test_executor_do_execute_and_record_recebe_o_snapshot_mesmo_com_mutacao_do_c
     run(ex, request=pedido)
     assert payload["texto"] == "ADULTERADO"  # a mutação concorrente aconteceu
     assert ex.calls[0]["payload"] == {"texto": "projeto A", "tags": ["a"]}
+
+
+def test_execute_and_record_executa_o_passo_uma_unica_vez_e_nao_o_expoe():
+    ex = FakeExecutor()
+    result, sink = run(ex)
+    assert len(ex.calls) == 1
+    assert [r.event for r in sink.rows].count("executed") == 1
+    assert not hasattr(result, "step")  # o passo (e seu selo) não vaza para o chamador
