@@ -39,6 +39,7 @@ Defesa em camadas (design §5.8), mais as decisões do usuário de 19/11/2026.
 
 Design §6 (`id`, `created_at`, `action`, `target`, `payload_hash`, `decision`, `reason`, `approval_id`, `result`, `duration_ms`, `error`, `prev_hash`, `row_hash`) **mais**:
 - `event` (decisão do usuário): preserva os eventos que o `AuditEntry` já tem: `created`, `callback`, `expired`, `superseded`, `authorization`, `executed`.
+- `timeout_ms` (inteiro, **aprovado em 19/11/2026**; ver ADR-001 decisão 9): timeout efetivamente utilizado, gravado na linha de M1 quando a autorização é `allowed`; nulo nas demais linhas. `CHECK` garante que uma linha `authorization`/`allowed` sempre o tenha. A conciliação usa este valor, nunca a configuração atual.
 - `correlation_id` (UUID, **aprovado**; ver ADR-001 decisão 9): gerado por tentativa de execução, persistido em M1 antes do executor, **com índice e sem unicidade**.
 - `chain_version` (smallint): versão do protocolo de hash da linha (decisão 9).
 - Evento novo `reconciled` (**aprovado**, decisão 10).
@@ -48,14 +49,17 @@ Design §6 (`id`, `created_at`, `action`, `target`, `payload_hash`, `decision`, 
 
 - `event`: o que aconteceu.
 - `decision`: a decisão de **autorização** associada ao evento.
-- `result`: o resultado **resumido** da execução, em vocabulário fechado: `ok`, `error` ou `unknown`. Nulo quando não houve execução.
+- `result`: o resultado **resumido** da execução, em vocabulário fechado: `ok`, `error` ou `unknown`. Nulo quando não houve execução (autorização negada). Uma autorização permitida **começa** com `unknown` e é seguida por `ok`, `error` ou `unknown` em M3 ou pela conciliação.
+- `reason`: o motivo da **decisão de autorização**; **nunca** recebe o nome de uma exceção. `error`: o nome (ou descrição sanitizada) da falha de execução.
+- O `event` é independente desses campos.
 
 **Mapeamento aprovado.** `decision` representa **só** a decisão de autorização; `result` representa **só** o resultado da execução; os dois conceitos não se misturam no modelo persistido. Os eventos do ciclo de aprovação preservam o vocabulário atual.
 
 | `event` | `decision` | `result` | Observação |
 |---|---|---|---|
-| `authorization` | `allowed` \| `denied` | nulo | M1 |
-| `executed` | `allowed` | `ok` \| `error` | M3; a linha herda a autorização que a permitiu |
+| `authorization` | `allowed` | `unknown` (inicial) | M1: a execução ainda não tem resultado conhecido; `error` nulo |
+| `authorization` | `denied` | nulo | M1 negado; `error` nulo |
+| `executed` | `allowed` | `ok` \| `error` \| `unknown` | M3. `error` = nome do tipo da exceção quando `result=error`; `unknown` com `error=ExecutorTimeout` quando o executor ultrapassa o timeout (ADR-001). `reason` **preserva o motivo original da autorização** |
 | `reconciled` | `allowed` | `unknown` | autorização sem resultado conclusivo |
 | `created`, `callback`, `expired`, `superseded` | vocabulário atual: `recorded`, `approved`, `rejected`, `denied`, `ignored`, `expired` | nulo | ciclo de aprovação (ADR-002) |
 
@@ -63,9 +67,11 @@ Design §6 (`id`, `created_at`, `action`, `target`, `payload_hash`, `decision`, 
 
 | `AuditEntry` em memória | Persistido |
 |---|---|
-| `event=executed`, `decision=ok` | `decision=allowed`, `result=ok` |
-| `event=executed`, `decision=error` | `decision=allowed`, `result=error` (`error` preenchido) |
-| `event=authorization`, `decision=allowed` / `denied` | idem, `result` nulo |
+| `event=executed`, `decision=ok` | `decision=allowed`, `result=ok`, `error` nulo, `reason` = `reason` da linha de autorização |
+| `event=executed`, `decision=error` (o gateway põe o nome da exceção em `reason`) | `decision=allowed`, `result=error`, `error=<nome da exceção>`, `reason` = `reason` **original da autorização** (o nome da exceção sai de `reason`) |
+| `event=executed`, `decision=error` com `ExecutorTimeout` | `decision=allowed`, `result=unknown`, `error=ExecutorTimeout`, `reason` original |
+| `event=authorization`, `decision=allowed` | `decision=allowed`, `result=unknown`, `timeout_ms` e `correlation_id` preenchidos |
+| `event=authorization`, `decision=denied` | `decision=denied`, `result` nulo, `error` nulo |
 | execução autorizada sem resultado conclusivo (produzida pela conciliação) | `event=reconciled`, `decision=allowed`, `result=unknown` |
 | eventos de aprovação | inalterados |
 
@@ -89,6 +95,7 @@ class AuditEntry:
     error: str | None = None           # descrição sanitizada de falha de execução; nunca stack trace
     duration_ms: int | None = None
     correlation_id: str | None = None
+    timeout_ms: int | None = None      # timeout efetivo gravado em M1
 ```
 
 A tradução para o modelo persistido (por exemplo, `decision="ok"` do evento `executed` vira `decision="allowed"`, `result="ok"`) fica em `app/actions/persistence.py`. **Vantagem:** os testes protegidos (`test_approval_invariants.py` linhas 204 e 346, que esperam `decision == "error"` e `"ok"`) e o AP-21 continuam válidos **sem alteração**.
@@ -101,7 +108,7 @@ Normativo; toda alteração de campos ou de serialização cria uma **nova vers�
 
 - **Algoritmo:** SHA-256, resultado em hexadecimal minúsculo de 64 caracteres.
 - **Entrada:** um objeto JSON com os campos abaixo, serializado em **JSON canônico UTF-8**: chaves ordenadas, sem espaços (`separators=(",", ":")`), `ensure_ascii=False`, `allow_nan=False`. **Valores nulos aparecem explicitamente** como `null`.
-- **Campos incluídos:** `protocol` (inteiro, `1`), `prev_hash`, `created_at`, `event`, `action`, `target`, `payload_hash`, `decision`, `reason`, `approval_id`, `correlation_id`, `result`, `duration_ms`, `error`. Ou seja, **todos os campos persistidos relevantes, incluindo `prev_hash`**.
+- **Campos incluídos:** `protocol` (inteiro, `1`), `prev_hash`, `created_at`, `event`, `action`, `target`, `payload_hash`, `decision`, `reason`, `approval_id`, `correlation_id`, `result`, `duration_ms`, `error`, `timeout_ms`. Ou seja, **todos os campos persistidos relevantes, incluindo `prev_hash`**. (`timeout_ms` entra no protocolo v1 porque nenhuma linha v1 foi gravada ainda; qualquer campo acrescentado depois exige a v2.)
 - **Campos excluídos:** `row_hash` (é o resultado) e `id` (valor da sequência, atribuído pelo banco e com lacunas em inserções abortadas; a ordem da cadeia vem de `prev_hash`). **Exclusão do `id` aprovada**, com a condição de que **todos os demais campos persistidos relevantes estejam cobertos**: o teste `test_row_hash_cobre_todos_os_campos_e_o_prev_hash` falha se uma coluna nova do modelo não for incluída no protocolo ou explicitamente excluída com justificativa.
 - **Datas:** UTC, ISO 8601 em um único formato fixo, `YYYY-MM-DDTHH:MM:SS.ffffffZ` (sempre seis casas decimais e o sufixo `Z`). `created_at` é definido pela aplicação **depois** de obtido o *lock* e gravado exatamente com esse valor (microssegundos, igual à precisão do `timestamptz`).
 - **Outros tipos:** UUID em minúsculas com hífens; `duration_ms` inteiro; hashes em hexadecimal minúsculo.
@@ -114,7 +121,7 @@ Normativo; toda alteração de campos ou de serialização cria uma **nova vers�
 - Cada inserção roda numa **transação própria e curta**: `BEGIN` → `pg_advisory_xact_lock(ACTIONLOG_ADVISORY_LOCK_KEY)` → ler o `row_hash` da última linha (ou os 64 zeros) → definir `created_at` → calcular `row_hash` → `INSERT` → `COMMIT`. O *lock* é liberado no fim da transação, o que serializa a inserção **dentro da transação**.
 - **Chave fixa, documentada e exclusiva:** `ACTIONLOG_ADVISORY_LOCK_KEY = 4296953195189417418`, derivada de forma reproduzível como os 8 primeiros bytes de SHA-256(`"freelance-agent:actionlog:v1"`) lidos como inteiro de 64 bits com sinal. Uma constante nomeada em um único módulo; um teste verifica que nenhum outro código usa a mesma chave nem chama `pg_advisory_*` sobre ela.
 - **Independência da transação de negócio (alias aprovado):** o `ActionLog` usa uma **conexão separada** (alias de banco dedicado, com as credenciais de `fa_app`) para que gravar a linha nunca participe da transação de negócio do chamador. Em Django, um `atomic()` aninhado na mesma conexão seria apenas um *savepoint* e seria desfeito junto. `ActionLog.append` falha se for chamado dentro de um bloco atômico da própria conexão. **Declarar o alias não basta:** os testes precisam **provar** (1) que o commit do `ActionLog` sobrevive ao rollback da transação de negócio e (2) que M1 foi confirmado **antes** da chamada ao executor, observado por uma terceira conexão dentro do executor falso.
-- **Conciliação (aprovada):** rotina periódica do `worker`. Localiza linhas `authorization`/`allowed` sem linha `executed` de mesmo `correlation_id` depois do **timeout configurado do executor + 2 minutos**, e acrescenta `reconciled`/`allowed`/`unknown`, reutilizando o `correlation_id`. É idempotente, nunca reexecuta e **não** afirma qual foi o resultado real.
+- **Conciliação (aprovada):** rotina periódica do `worker`. Localiza linhas `authorization`/`allowed` sem linha `executed` de mesmo `correlation_id` depois do **`timeout_ms` registrado em M1 + 2 minutos** (não do timeout atual da configuração), e acrescenta `reconciled`/`allowed`/`unknown`, reutilizando o `correlation_id`. É idempotente, nunca reexecuta e **não** afirma qual foi o resultado real.
 
 ### 11. Verificação de privilégios e conexões nos testes (decisão do usuário)
 
@@ -137,7 +144,7 @@ Toda fixture afirma, antes dos testes:
 Os sete testes do design §5.8 permanecem, agora com essas conexões:
 `test_app_nao_consegue_update_no_actionlog`, `..._delete_...`, `..._truncate_...`, `test_app_nao_consegue_alter_table_nem_disable_trigger` (todos como `fa_app`); `test_trigger_bloqueia_update_mesmo_como_owner` (como `fa_owner`); `test_delete_de_oportunidade_nao_afeta_actionlog`; `test_verify_action_log_detecta_linha_alterada` (único com superusuário).
 
-Testes novos decorrentes das decisões: `test_prev_hash_e_unico_e_impede_bifurcacao` (segunda linha com o mesmo `prev_hash` é rejeitada), `test_decision_e_result_nao_se_misturam` (`decision` ∈ vocabulário de autorização/aprovação; `result` ∈ {`ok`,`error`,`unknown`} ou nulo), `test_error_nao_guarda_stack_trace_nem_conteudo`, `test_conexoes_de_teste_tem_papel_e_privilegios_esperados`, `test_nenhum_papel_alem_do_superusuario_adultera_linha`, `test_cadeia_comeca_com_64_zeros`, `test_row_hash_cobre_todos_os_campos_e_o_prev_hash` (alterar qualquer campo muda o hash), `test_serializacao_canonica_v1_vetores_fixos`, `test_insercoes_concorrentes_nao_bifurcam_a_cadeia`, `test_lock_exclusivo_do_actionlog`, `test_append_em_transacao_independente_sobrevive_ao_rollback_do_chamador`, `test_nenhuma_coluna_guarda_conteudo_bruto` (marcador no payload e no retorno do executor nunca aparece no banco), `test_verify_chain_aceita_versoes_mistas`.
+Testes novos decorrentes das decisões: `test_check_exige_timeout_em_autorizacao_permitida`, `test_prev_hash_e_unico_e_impede_bifurcacao` (segunda linha com o mesmo `prev_hash` é rejeitada), `test_decision_e_result_nao_se_misturam` (`decision` ∈ vocabulário de autorização/aprovação; `result` ∈ {`ok`,`error`,`unknown`} ou nulo), `test_error_nao_guarda_stack_trace_nem_conteudo`, `test_conexoes_de_teste_tem_papel_e_privilegios_esperados`, `test_nenhum_papel_alem_do_superusuario_adultera_linha`, `test_cadeia_comeca_com_64_zeros`, `test_row_hash_cobre_todos_os_campos_e_o_prev_hash` (alterar qualquer campo muda o hash), `test_serializacao_canonica_v1_vetores_fixos`, `test_insercoes_concorrentes_nao_bifurcam_a_cadeia`, `test_lock_exclusivo_do_actionlog`, `test_append_em_transacao_independente_sobrevive_ao_rollback_do_chamador`, `test_nenhuma_coluna_guarda_conteudo_bruto` (marcador no payload e no retorno do executor nunca aparece no banco), `test_verify_chain_aceita_versoes_mistas`.
 
 ## Consequências
 
@@ -159,11 +166,15 @@ Testes novos decorrentes das decisões: `test_prev_hash_e_unico_e_impede_bifurca
 - O PostgreSQL 17 é garantido no CI e no compose; localmente os testes podem rodar em 16. Nada aqui depende de recurso exclusivo do 17.
 - `scripts/test_db_setup.sh` concede `CREATEDB` a `fa_owner` **só para o pytest-django criar o banco de teste**; isso não o torna superusuário, e os testes afirmam `rolsuper = false`.
 
+## Escopo de proteção (decisão do usuário, 19/11/2026)
+
+A superfície de segurança do registro inclui quem grava e armazena as decisões. Entram na relação de **arquivos com alteração controlada**, ao lado de `policy`, `approval`, `gateway`, `audit` e `authorization_md`: **`app/actions/persistence.py`** e **`app/models/actions.py`**. O `scripts/check_protected_paths.py` é alinhado (fonte única das listas) e, quando existir, o `.github/CODEOWNERS` também.
+
 ## Impactos em testes e interfaces
 
 | Item | Impacto |
 |---|---|
-| `AuditEntry` | Quatro campos opcionais novos (opção A); nenhum teste protegido muda. |
+| `AuditEntry` | **Cinco** campos opcionais novos (`result`, `error`, `duration_ms`, `correlation_id`, `timeout_ms`; opção A); nenhum teste protegido muda. |
 | `ActionLog.append(entry)` | Calcula `prev_hash`/`row_hash` sob *lock*, em conexão independente; define `created_at` e `chain_version`. |
 | `verify_chain()` | Devolve `VerifyResult(ok, first_bad_id)`; implementa o protocolo v1 e aceita versões mistas. |
 | Migração do `action_log` | Colunas `event`, `correlation_id`, `chain_version`; `REVOKE` explícito; *triggers*; sem FKs. |

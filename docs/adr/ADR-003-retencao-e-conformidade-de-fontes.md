@@ -48,8 +48,19 @@ Como (a) só buscar em fontes cuja conformidade esteja comprovada e (b) nunca ma
     - `unfiltered` é restrito a **operações internas de limpeza e conformidade**: a rotina de retenção (`purge_expired`), a métrica `content_max_age_hours` (que precisa enxergar as linhas expiradas que ainda existem) e a verificação de conformidade. Um teste de arquitetura varre o código e falha se `unfiltered` aparecer fora de uma lista fechada de módulos.
     - **Armadilha do Django, tratada explicitamente:** o *base manager* (usado em exclusões em cascata e em acessos por relação) **não pode** filtrar; se filtrasse, apagar uma oportunidade deixaria para trás as linhas de conteúdo expiradas. Por isso o filtro vive no *default manager*, não no *base manager*. Como o acesso pela relação reversa (`opportunity.content`) passa pelo *base manager* e **não** é filtrado, a relação reversa é desativada (`related_name="+"`) e o acesso ao conteúdo de uma oportunidade/avaliação é feito por funções explícitas que usam `visible` (por exemplo, `OpportunityContent.visible.filter(opportunity=...)`). Evitar `select_related`/`prefetch_related` sobre essas tabelas.
 
-11. **Relógio do filtro: o do banco** (decisão do usuário, P-003.7). `visible` compara `expires_at` com o `now()` do banco, nunca com o relógio do processo. Para que os testes não dependam do relógio real, as fixtures definem `expires_at`/`fetched_at` **explicitamente** a partir de deslocamentos do próprio relógio do banco, e a fronteira estrita (`expires_at = now()` não é visível) é testada numa mesma transação. **Nota de implementação a verificar:** no PostgreSQL, `Now()` do Django gera `STATEMENT_TIMESTAMP()`, e não o `now()` da transação; para o teste de fronteira ser determinístico, deve-se usar uma expressão que gere `transaction_timestamp()`/`now()`. Funções de serviço com horário como parâmetro (`purge_expired(now)`, Tarefa 3.6) continuam recebendo-o explicitamente.
+11. **Relógio do filtro: o do banco** (decisão do usuário, P-003.7). `visible` compara `expires_at` com o relógio do banco, nunca com o relógio do processo Python. **Correção do usuário a uma nota anterior:** no PostgreSQL, o `Now()` do Django usa `STATEMENT_TIMESTAMP()`, e não o instante de início da transação (`CURRENT_TIMESTAMP`/`now()`). Portanto:
+    - os testes de fronteira validam a **semântica real da consulta SQL**, e não dependem de congelar o relógio Python (nada de `freezegun` ou `mock` sobre `datetime` para o filtro);
+    - fixtures definem `expires_at`/`fetched_at` explicitamente, com deslocamentos calculados **no próprio banco** a partir do mesmo relógio do filtro;
+    - quando for preciso comparar no mesmo instante exato, a comparação é feita **dentro do banco**, em uma única instrução SQL;
+    - funções de serviço com horário como parâmetro (`purge_expired(now)`, Tarefa 3.6) continuam recebendo-o explicitamente, e isso é independente do filtro.
 12. **Admin: só conteúdo ainda visível** (decisão do usuário, P-003.8). O Admin dos modelos de conteúdo (se existir) usa o *default manager* filtrado e não é uma porta alternativa para ler conteúdo expirado. `unfiltered` fica restrito aos serviços internos de limpeza e conformidade.
+
+13. **Regras de modelo para conteúdo futuro da Upwork (decisão do usuário, P-003.5).**
+    - Entrada manual continua sob a exceção temporária D4, sem expiração.
+    - Conteúdo obtido da Upwork: `raw_payload` **sempre nulo**.
+    - Conteúdo da Upwork e o texto derivado dele: TTL máximo de **24 h**.
+    - **Camada de imposição:** validação no modelo (`save()`/`clean()` das tabelas de conteúdo e de `Source`) e `CHECK` no banco para o que couber numa única tabela (`Source.content_ttl_hours ≤ 24`). A regra de `raw_payload` depende de outra tabela (`Source`), então fica em validação de modelo, com teste.
+    - **Nenhuma dessas regras autoriza implementar o conector da Upwork** (nem qualquer conector). `platform.search` segue sem executor (AZ-16).
 
 ## Consequências
 
@@ -85,7 +96,7 @@ Como (a) só buscar em fontes cuja conformidade esteja comprovada e (b) nunca ma
 | P-003.7 | Relógio do filtro | **Resolvida e aprovada** (decisão 11): relógio do banco. |
 | P-003.8 | Admin dos modelos de conteúdo | **Resolvida e aprovada** (decisão 12): só conteúdo visível. |
 | P-003.4 | **Onde a margem de 4 h é aplicada** (modelo, serviço ou limpeza). A Tarefa 3.6 testa `test_expires_at_aplica_margem_de_4h`; a Tarefa 2.1 não menciona a margem. | Definir na Tarefa 2.1 apenas o que for necessário para o modelo; o cálculo fica para 3.6. |
-| P-003.5 | **Como impor no banco** que `raw_payload` é nulo para a Upwork e que o TTL não excede 24 h (validação de modelo, `CHECK` ou ambos). O design diz "validado", sem especificar a camada. | Tarefa 2.1. |
+| P-003.5 | Imposição de `raw_payload` nulo (Upwork) e TTL ≤ 24 h | **Resolvida** (decisão 13): validação de modelo + `CHECK` no que couber numa tabela. |
 | P-003.6 | Hospedagem: **reavaliar VPS antes da Fase 5** (D3). | Fora da Fase 2. |
 
 ## Referências

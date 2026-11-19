@@ -45,9 +45,9 @@ Sobre o registro transacional (decisão do usuário), foram consideradas as duas
 
 | Momento | O que acontece | Transação |
 |---|---|---|
-| **M1. Autorização** | Autoriza (função pura) e grava no `ActionLog` a linha `event=authorization` com `decision=allowed` ou `denied`. **Confirma (commit) antes de qualquer outra coisa.** Se negada, é a única linha e o fluxo termina aqui. | Transação própria, curta, **independente** de qualquer transação de negócio |
+| **M1. Autorização** | Autoriza (função pura) e grava no `ActionLog` a linha `event=authorization` com `decision=allowed` ou `denied`, o `correlation_id` e, quando permitida, o **timeout efetivamente utilizado** (`timeout_ms`). **Confirma (commit) antes de qualquer outra coisa.** Se negada, é a única linha e o fluxo termina aqui. | Transação própria, curta, **independente** de qualquer transação de negócio |
 | **M2. Execução** | Chama o executor. Nenhuma transação do `ActionLog` fica aberta. As alterações locais de negócio que o chamador faça pertencem à transação **dele**, que é revertida se a execução falhar. | Nenhuma do `ActionLog` |
-| **M3. Resultado** | Grava `event=executed` com `result=ok` ou `error` (tipo da exceção, sem conteúdo), `duration_ms` e `error`. | **Nova** transação independente |
+| **M3. Resultado** | Grava `event=executed` com `result=ok` ou `error` (nome do tipo da exceção em `error`, sem conteúdo) e `duration_ms`. **`reason` preserva o motivo original da autorização** e nunca recebe o nome da exceção. | **Nova** transação independente |
 
 Regras:
 - **Falha gera registro de erro** mesmo que as alterações locais de negócio sejam revertidas, porque M3 não participa da transação de negócio.
@@ -56,14 +56,19 @@ Regras:
 - **`correlation_id` (aprovado).** É gerado **a cada tentativa de execução**, **persistido em M1 antes de chamar o executor**, e reutilizado nas linhas de resultado (M3) e de conciliação. Tem **índice** para busca, mas **não é único**, pois uma tentativa gera vários eventos.
 - **Queda do processo entre M1 e M3** deixa uma linha `authorization`/`allowed` **sem linha `executed`** de mesmo `correlation_id`. A conciliação a identifica e acrescenta `event=reconciled`, `decision=allowed`, `result=unknown`.
 - **`unknown` é terminal para execução automática.** A rotina identifica e registra a situação, **nunca reexecuta**. A conciliação **não descobre** o resultado real: apenas registra que a execução permaneceu sem conclusão conhecida. Tentar de novo exige nova avaliação e, quando o nível for "Minha aprovação", **nova aprovação humana** (ADR-002).
-- **Conciliação (aprovada).** Executada pelo `worker`, por rotina periódica. Uma autorização só é considerada sem conclusão depois de **o timeout máximo configurado do executor + 2 minutos de tolerância**, para não marcar como desconhecida uma chamada legítima ainda em andamento. Consequência: **cada executor precisa ter um timeout explicitamente configurado**; sem ele, `execute_and_record` recusa a ação (falha fechada) e a conciliação não tem como classificá-la. Os timeouts ficam em configuração (`settings`), **nunca** no `registry.py` (arquivo protegido).
+- **Timeout registrado em M1 (decisão do usuário, 19/11/2026).** O timeout **efetivamente utilizado** naquela tentativa é gravado na linha de M1 (`timeout_ms`, coberto pelo hash, ADR-006). A conciliação **não depende da configuração atual**: se o timeout do executor for alterado depois que uma execução começou, a rotina continua usando o valor que valia para aquela tentativa.
+- **Conciliação (aprovada).** Executada pelo `worker`, por rotina periódica. Uma autorização só é considerada sem conclusão depois de **`timeout_ms` registrado em M1 + 2 minutos de tolerância** (contados a partir de `created_at` da linha de M1), para não marcar como desconhecida uma chamada legítima ainda em andamento. Consequência: **cada executor precisa ter um timeout explicitamente configurado**; sem ele, `execute_and_record` **recusa a ação antes de M1** (falha fechada) e registra uma linha `authorization`/`denied` com `reason=timeout_executor_nao_configurado`. Os timeouts ficam em configuração (`settings`), **nunca** no `registry.py` (arquivo protegido).
+- **O timeout gravado é o timeout aplicado, e ele efetivamente limita a execução** (decisão do usuário, 19/11/2026). `execute_and_record` resolve o timeout na configuração, grava-o em M1 e chama o executor com **esse mesmo valor** (contrato `TimedExecutor`, que recebe `timeout_ms`; o *wrapper* o fixa antes de entregar o executor ao `run_step`). Além de o executor honrar o timeout internamente (por exemplo, o do cliente HTTP), `persistence.py` impõe um **prazo rígido** em M2.
+- **Executor que ultrapassa o limite (proposta de tratamento, a confirmar):** deixa de ser uma execução normal. O *wrapper* levanta `ExecutorTimeout`; `run_step` o trata como falha do executor e M3 grava `decision=allowed`, `result=unknown`, `error=ExecutorTimeout` (**não** `ok`, e não `error` simples, porque o efeito externo pode ter ocorrido). **Nada assume que cancelar a espera desfaz o efeito externo**: o trabalho do executor pode continuar em segundo plano, pois uma chamada em execução não pode ser interrompida à força de forma segura. Qualquer resultado tardio é **descartado**: não gera segunda linha terminal, não altera o `ActionLog` e é registrado só no log de aplicação (IDs e hashes). O resultado `unknown` é terminal e nunca provoca reexecução automática; numa ação com aprovação, vale a regra do ADR-002 (aprovação consumida).
 - Se M3 falhar (banco indisponível), o processo registra o fato no log de aplicação (só IDs e hashes) e devolve o resultado ao chamador; a linha `authorization` sem conclusão será tratada pela conciliação.
 - O resultado devolvido pelo executor **não é gravado** no `ActionLog`; só o resumo `ok`/`error`/`unknown` (ver ADR-006).
 
 ### 10. Impacto no desenho do gateway
 
 O plano P9 (Tarefa 2.5) descreve `execute_and_record` como "chama `execute()` e grava as `AuditEntry`". Isso é incompatível com M1 confirmado antes de M2. A proposta, **a revisar antes de implementar** (alteração controlada de `gateway.py`):
-- dividir `execute()` em dois passos puros e públicos, `authorize_step(request, ctx, registry) -> (Decision, AuditEntry, payload_hash)` e `run_step(decision, request, ctx, executor) -> ExecutionResult` (parte pós-autorização, incluindo `mark_used` do `ApprovalRecord`);
+- dividir `execute()` em dois passos públicos:
+  - `authorize_step(request, ctx, registry, *, correlation_id, timeout_ms) -> AuthorizationStep` é **determinística**: não gera identificadores nem aleatoriedade, não acessa banco nem rede. `correlation_id` e `timeout_ms` são **obtidos por `persistence.py` e passados** ao gateway;
+  - `run_step(step, request, ctx, executor) -> ExecutionResult` **não é pura**: ela chama o executor, que produz efeitos externos (e inclui o `mark_used` do `ApprovalRecord`). Continua sem gravar no banco, sem gerar identificadores e sem impor o timeout; essa responsabilidade (e a de falha em M1) é de `persistence.py`;
 - `execute()` continua existindo e passa a ser a composição dos dois passos, **sem mudar comportamento nem assinatura**, para que os 66 testes existentes de `tests/actions/` sigam intactos;
 - `execute_and_record` (em `app/actions/persistence.py`) orquestra: `authorize_step` → grava e confirma M1 → `run_step` → grava M3.
 
@@ -107,6 +112,15 @@ O plano P9 (Tarefa 2.5) descreve `execute_and_record` como "chama `execute()` e 
 - `test_sem_actionlog_nao_ha_fallback_de_execucao`: com a gravação de M1 indisponível (falha simulada, ou banco fora), o executor não é chamado.
 - `test_executor_sem_timeout_configurado_e_recusado`.
 - `test_conciliacao_respeita_timeout_mais_2_minutos`: antes do limiar não marca; depois, marca.
+- `test_timeout_efetivo_registrado_em_m1_e_aplicado_ao_executor`: o valor gravado na linha de M1 é o mesmo que o executor falso recebe.
+- `test_conciliacao_usa_timeout_registrado_e_nao_a_configuracao_atual`: altera a configuração depois de M1; a conciliação usa o valor gravado.
+- `test_acao_sem_timeout_grava_negacao_e_nao_chama_executor`.
+- `test_executor_que_ultrapassa_o_timeout_nao_e_execucao_normal`: `result=unknown`, `error=ExecutorTimeout`, nunca `ok`.
+- `test_timeout_nao_assume_que_cancelar_desfaz_efeitos`: o executor falso conclui depois do prazo; o efeito é observável, mas o `ActionLog` **não** ganha segunda linha terminal e a execução não é reexecutada.
+- `test_resultado_tardio_e_descartado_e_nao_altera_o_actionlog`.
+- `test_timeout_rigido_nao_depende_da_cooperacao_do_executor`: um executor que ignora o timeout é liberado do ponto de vista do chamador no prazo.
+- `test_falha_do_executor_preserva_reason_da_autorizacao`: `reason` = motivo original da autorização; o nome da exceção vai só em `error`.
+- `test_autorizacao_permitida_comeca_com_result_unknown`.
 - `test_conciliacao_nunca_reexecuta_e_unknown_e_terminal`: o executor falso não é chamado de novo e nenhuma rotina automática transforma `unknown` em outra coisa.
 - `test_conciliacao_e_idempotente`: rodar duas vezes não gera duas linhas `reconciled`.
 - `test_linha_nao_contem_payload_nem_retorno_do_executor`.
@@ -123,7 +137,7 @@ O plano P9 (Tarefa 2.5) descreve `execute_and_record` como "chama `execute()` e 
 | P-001.5 | **`.github/` (workflow e `CODEOWNERS`) não existe** no repositório; confirmar se a Tarefa 1.5 foi concluída. | Aberta. |
 | P-001.6 | Limiar e responsável pela conciliação | **Resolvida**: timeout do executor + 2 min; `worker`, rotina periódica. |
 | P-001.7 | Divisão de `gateway.py` e `correlation_id` | **Aprovada** (dois passos puros; `execute()` como composição; `correlation_id` indexado, não único). |
-| P-001.8 | **Valores dos timeouts** de `llm.evaluate` e `owner.notify`, e se a conciliação lê o timeout da configuração no momento da rotina ou de um valor gravado em M1. Reduzir o timeout depois de uma tentativa em andamento poderia antecipar a marcação. | Aberta, sem bloquear a Fase 2 (os testes usam executor falso com timeout explícito). Os valores reais são definidos nas Fases 3 e 4, quando os executores existirem. |
+| P-001.8 | Timeouts de `llm.evaluate` e `owner.notify` | **Parcialmente resolvida.** A **estrutura** (timeout gravado em M1 e usado pela conciliação) entra **na Fase 2**. Os **valores** reais dos dois executores ficam para as Fases 3 e 4; os testes da Fase 2 usam executor falso com timeout explícito. |
 
 ## Referências
 - Design: `docs/superpowers/specs/2026-11-18-descoberta-avaliacao-design.md` §5.5, §5.5.1
