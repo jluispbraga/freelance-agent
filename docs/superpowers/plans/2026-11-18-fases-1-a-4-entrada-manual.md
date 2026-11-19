@@ -25,6 +25,17 @@
 4. **A Fase 3 pode ser desenvolvida parcialmente sem F1 e F5**, com cliente de LLM falso e golden set fictício nos testes. Ela **não pode ser declarada concluída** sem os critérios: F1 + P10 (custo medido com a API real), F5 (golden set executado) e F4 (Tarefa 3.1).
 5. **Subagentes não alteram `AUTHORIZATION.md`, o registro de permissões nem os critérios de segurança sem revisão.** Ver "Regras de execução por subagentes".
 
+## Ajustes da Fase 2 (19/11/2026)
+
+Decisões do usuário registradas nos ADRs 001, 002, 003 e 006 (`docs/adr/`, revisão 3). Elas **não** habilitam conectores, executores nem permissões novas.
+
+1. **Registro em três momentos (ADR-001).** M1 grava e confirma a autorização, o `correlation_id` e o **timeout efetivamente utilizado**; M2 executa fora de qualquer transação do `ActionLog`; M3 grava `ok` ou `error` em nova transação independente. Falha fechada: sem M1 confirmado, o executor não roda, sem *fallback*. `unknown` é terminal e nunca provoca reexecução. A conciliação (`worker`) usa o **timeout registrado em M1 + 2 min**.
+2. **`ActionLog` (ADR-006).** Colunas `event`, `correlation_id` (índice, não único), `timeout_ms`, `chain_version`, `error` (separada de `reason`); `decision` = autorização, `result` = `ok` | `error` | `unknown`. Protocolo de hash v1 (inclui `prev_hash`, exclui `id`), `UNIQUE(prev_hash)`, *lock* exclusivo, alias de conexão independente. `audit.py` pela Opção A (campos opcionais), sem alterar testes protegidos.
+3. **Conteúdo expirado (ADR-003).** Managers `visible` (padrão) e `unfiltered` nos **dois** modelos de conteúdo; sem `objects`; *base manager* sem filtro; `related_name="+"`; relógio do banco; Admin e API só veem conteúdo visível.
+4. **Regras de modelo para a Upwork (ADR-003, P-003.5).** `raw_payload` nulo e TTL ≤ 24 h. **Nenhuma dessas regras autoriza implementar o conector.**
+5. **Portão de revisão.** Antes de aplicar qualquer alteração em `app/actions/audit.py` e `app/actions/gateway.py`, o **diff é apresentado ao usuário e aprovado**. A Tarefa 2.1 só começa após a revisão final de interfaces e testes.
+6. **`DATABASE_URL_SUPER`** existe só em testes e CI; nunca em `web`, `worker`, `bot`, `migrate` ou `db`.
+
 **Decisões D3 e D4:**
 - **D3:** nas Fases 1 a 4, o sistema roda na máquina do usuário com Docker Compose; o repositório é GitHub privado, e o CI é GitHub Actions com PostgreSQL 17. A migração para VPS será reavaliada antes da Fase 5.
 - **D4:** a alternativa A (exceção documentada) está aprovada **temporariamente** e vale **só enquanto houver apenas entrada manual**. A retenção será reavaliada antes de qualquer conector; a exceção **não é herdada** pela Fase 5.
@@ -43,7 +54,7 @@
 - `docs/superpowers/specs/**`, `docs/reviews/**` e este plano (critérios de segurança)
 
 **Arquivos de segurança com alteração controlada.** Só podem mudar exatamente como a tarefa do plano descreve, com revisão independente:
-- `app/actions/{policy,approval,gateway,audit,authorization_md}.py`
+- `app/actions/{policy,approval,gateway,audit,authorization_md,persistence}.py` e `app/models/actions.py` (**`persistence.py` e `models/actions.py` incluídos em 19/11/2026**: registram e armazenam as decisões de autorização; `scripts/check_protected_paths.py` alinhado e, quando existir, o `CODEOWNERS`)
 - a migração do `action_log` (REVOKE e *triggers*)
 - `docker-compose.yml` (propriedades de segurança)
 - `.github/workflows/**` e `CODEOWNERS`
@@ -76,6 +87,8 @@ Nenhum subagente habilita conectores, cria executores ou amplia autorizações.
 - Automação de navegador.
 - Persistência do `ApprovalRequest` e o teste AP-12. **O AP-12 é requisito obrigatório antes de habilitar o módulo de propostas.**
 - Propostas, contratos, entrega, pagamentos e o sandbox de desenvolvimento.
+- **Resolução do P-002.6** (tensão entre a invariante 4, o AP-13 e o registro em três momentos para falha **conhecida** do executor). Adiada por decisão do usuário: será revisada junto com AP-12 e AP-13 **antes de habilitar qualquer executor de envio**. Nenhum invariante protegido é alterado nesta fase.
+- Valores finais dos timeouts de `llm.evaluate` e `owner.notify` (Fases 3 e 4). A **estrutura** que registra o timeout em M1 entra na Fase 2.
 
 ## Dependências (portões)
 
@@ -230,19 +243,31 @@ Fases: 1 → 2 → 3 → 4, em sequência. Dentro de cada fase, as tarefas segue
 
 **Interfaces:**
 - Produz os modelos da seção 6 do design (`Profile`, `Source`, `FeeSchedule`, `SearchQuery`, `OAuthCredential`, `Opportunity`, `OpportunityContent`, `Evaluation`, `EvaluationContent`, `Feedback`, `TelegramMessage`, `PipelineRun`).
-- Produz o manager `OpportunityContent.visible` (filtra `expires_at IS NULL OR expires_at > now()`).
+- Produz, em **`OpportunityContent` e `EvaluationContent`**, dois managers (ADR-003 §10–12):
+  - `visible`: **manager padrão**; filtra `expires_at IS NULL OR expires_at > <relógio do banco>`. Usado por API, Admin e serviços comuns.
+  - `unfiltered`: todas as linhas; **restrito** à limpeza e à conformidade (`app/services/retention.py` e o módulo de conformidade).
+  - **Não existe `objects`.** O *base manager* **permanece sem filtro** (cascatas e relações). A relação com o pai durável usa `related_name="+"`; o acesso ao conteúdo é por consulta explícita em `visible`.
+- Regras de modelo (ADR-003 §13): `raw_payload` é nulo para fonte Upwork; TTL de fonte de terceiros ≤ 24 h (validação de modelo e `CHECK` em `Source.content_ttl_hours`). Entrada manual segue a exceção temporária D4. **Nada disso implementa o conector.**
 
 - [ ] Testes que falham:
   - `test_profile_e_singleton`;
   - `test_ttl_de_fonte_acima_de_24h_e_rejeitado`;
   - `test_tokens_oauth_criptografados_no_banco`: o valor bruto da coluna é diferente do texto puro;
   - `test_oportunidade_unica_por_fonte_e_external_id`;
-  - `test_manager_visible_esconde_conteudo_expirado`;
+  - `test_manager_visible_esconde_conteudo_expirado`: **parametrizado para `OpportunityContent` e `EvaluationContent`**;
   - `test_conteudo_manual_nao_expira`;
-  - `test_profile_sem_valores_padrao_de_preco`: campos de preço e custos são nulos por padrão; nenhum valor ilustrativo vai para a produção.
+  - `test_profile_sem_valores_padrao_de_preco`: campos de preço e custos são nulos por padrão; nenhum valor ilustrativo vai para a produção;
+  - `test_default_manager_de_conteudo_e_filtrado`;
+  - `test_nao_existe_manager_objects_nos_modelos_de_conteudo`;
+  - `test_base_manager_nao_filtra_e_cascata_apaga_conteudo_expirado`;
+  - `test_relacao_reversa_para_conteudo_nao_e_exposta`;
+  - `test_unfiltered_so_em_modulos_autorizados` (varredura de código com lista fechada de módulos);
+  - `test_fronteira_de_expiracao_validada_no_banco`: compara no próprio banco, em uma única instrução SQL, sem congelar o relógio Python (nota: o `Now()` do Django é `STATEMENT_TIMESTAMP()`);
+  - `test_raw_payload_de_fonte_upwork_deve_ser_nulo`;
+  - `test_ttl_do_conteudo_da_upwork_nao_excede_24h`.
 - [ ] Implementar, ver passar, commit.
 
-**Concluída quando:** as migrações aplicam do zero e os 7 testes passam.
+**Concluída quando:** as migrações aplicam do zero e os 7 testes originais e os 7 novos passam.
 
 ### Tarefa 2.2: Máquina de estados da oportunidade
 
@@ -281,14 +306,17 @@ Fases: 1 → 2 → 3 → 4, em sequência. Dentro de cada fase, as tarefas segue
 ### Tarefa 2.4: `ActionLog` persistido e *append-only*
 
 **Arquivos:**
-- Criar: `app/models/actions.py`, a migração (REVOKE + *triggers*) e `app/management/commands/verify_action_log.py`
-- Teste: `tests/db/test_actionlog_append_only.py` (PostgreSQL, conectando como `fa_app`)
+- Criar: `app/models/actions.py`, a migração (colunas, `REVOKE`, *triggers*, `UNIQUE(prev_hash)`, `CHECK`, índice) e `app/management/commands/verify_action_log.py`
+- Modificar: `app/actions/audit.py` (**só após aprovação do diff**, Opção A); `app/config/settings.py` (alias de banco independente do `ActionLog`, credenciais de `fa_app`); `scripts/test_db_setup.sh` e `tests/conftest.py` (`DATABASE_URL_SUPER`, só testes e CI)
+- Teste: `tests/db/test_actionlog_append_only.py` (PostgreSQL, três conexões reais separadas) e `tests/infra/test_compose_policy.py` (acréscimos)
 
 **Interfaces:**
-- Produz: `ActionLog.append(entry: AuditEntry) -> ActionLog`, que calcula `prev_hash` e `row_hash` sob *advisory lock*
-- Produz: `verify_chain() -> VerifyResult(ok: bool, first_bad_id: int | None)`
+- Produz: `ActionLog.append(entry: AuditEntry) -> ActionLog`: conexão independente, `pg_advisory_xact_lock(ACTIONLOG_ADVISORY_LOCK_KEY)`, calcula `created_at`, `prev_hash` e `row_hash` pelo **protocolo v1** (ADR-006 §9) e grava `chain_version`. Falha se chamado dentro de um bloco atômico da própria conexão.
+- Produz: `verify_chain() -> VerifyResult(ok: bool, first_bad_id: int | None)`, com suporte a versões mistas.
+- Esquema (ADR-006 §6): `event`, `decision`, `result` (`ok`|`error`|`unknown`|nulo), `reason`, `error`, `duration_ms`, `timeout_ms`, `correlation_id` (índice, **não único**), `approval_id` (sem FK), `chain_version`, `prev_hash` (**`UNIQUE`**), `row_hash`. `CHECK`: linha `authorization`/`allowed` exige `timeout_ms`.
+- Conexões de teste: `como_dono` (`fa_owner`, não superusuário), `como_app` (`fa_app`) e `como_superusuario` (`DATABASE_URL_SUPER`, **só** no teste de adulteração, com restauração do *trigger* em `finally`). Toda fixture afirma `current_user`, flags dos papéis e privilégios efetivos (`has_table_privilege`, `relowner`, `relacl` sem `PUBLIC`).
 
-- [ ] Testes que falham (os 7 da seção 5.8 do design):
+- [ ] Testes que falham (os 7 da seção 5.8 do design, **agora com essas conexões**):
   - `test_app_nao_consegue_update_no_actionlog`;
   - `test_app_nao_consegue_delete_no_actionlog`;
   - `test_app_nao_consegue_truncate_no_actionlog`;
@@ -296,25 +324,64 @@ Fases: 1 → 2 → 3 → 4, em sequência. Dentro de cada fase, as tarefas segue
   - `test_trigger_bloqueia_update_mesmo_como_owner`;
   - `test_delete_de_oportunidade_nao_afeta_actionlog`;
   - `test_verify_action_log_detecta_linha_alterada`.
+- [ ] Testes novos (ADR-006):
+  - **as três garantias prioritárias:** `test_row_hash_cobre_todos_os_campos_e_o_prev_hash`; `test_insercoes_concorrentes_nao_bifurcam_a_cadeia`; `test_append_em_transacao_independente_sobrevive_ao_rollback_do_chamador`;
+  - `test_prev_hash_e_unico_e_impede_bifurcacao`;
+  - `test_conexoes_de_teste_tem_papel_e_privilegios_esperados`;
+  - `test_nenhum_papel_alem_do_superusuario_adultera_linha`;
+  - `test_cadeia_comeca_com_64_zeros`;
+  - `test_serializacao_canonica_v1_vetores_fixos` (vetores revisados pelo usuário);
+  - `test_lock_exclusivo_do_actionlog`;
+  - `test_verify_chain_aceita_versoes_mistas`;
+  - `test_decision_e_result_nao_se_misturam`;
+  - `test_error_nao_guarda_stack_trace_nem_conteudo`;
+  - `test_nenhuma_coluna_guarda_conteudo_bruto`;
+  - `test_check_exige_timeout_em_autorizacao_permitida`;
+  - `test_correlation_id_e_indexado_e_nao_unico`;
+  - `test_database_url_super_nao_aparece_em_nenhum_servico_do_compose`, `test_settings_nao_leem_database_url_super` e `test_env_examples_nao_contem_database_url_super`.
 - [ ] Implementar, ver passar, commit.
 
-**Concluída quando:** os 7 testes passam e `save()`/`delete()` no modelo levantam erro antes de chegar ao banco.
+**Concluída quando:** os 7 testes originais e os novos passam contra PostgreSQL real, conectando de fato como `fa_app`, e `save()`/`delete()` no modelo levantam erro antes de chegar ao banco. Os testes unitários isolados não bastam.
 
 ### Tarefa 2.5: Gateway grava no `ActionLog`
 
-**Arquivos:** modificar `app/actions/gateway.py` (persistência opcional injetada); criar `app/actions/persistence.py`; teste em `tests/db/test_gateway_persistence.py`
+**Arquivos:** modificar `app/actions/gateway.py` (**só após aprovação do diff**); criar `app/actions/persistence.py`; teste em `tests/db/test_gateway_persistence.py`
 
 **Interfaces:**
-- Produz: `execute_and_record(request: ActionRequest, ctx: Context, executor) -> ExecutionResult`. Ela chama `execute()` e grava cada `AuditEntry` do resultado, na mesma transação da execução.
+- Em `gateway.py` (alteração controlada): dividir `execute()` em dois passos públicos.
+  - `authorize_step(request, ctx, registry, *, correlation_id, timeout_ms) -> AuthorizationStep` é **determinística**; `correlation_id` e `timeout_ms` são **obtidos por `persistence.py` e passados**, sem aleatoriedade escondida.
+  - `run_step(step, request, ctx, executor) -> ExecutionResult` **não é pura**: chama o executor, que produz efeitos externos. Não grava, não gera identificadores e não impõe o timeout.
+  - **`execute()` permanece, com a mesma assinatura e o mesmo comportamento, como composição dos dois.**
+- Produz: `execute_and_record(request: ActionRequest, ctx: Context, executor: TimedExecutor) -> ExecutionResult`, em três momentos (ADR-001 §9):
+  - **M1:** resolve o timeout configurado da ação (sem timeout → grava `authorization`/`denied` com `reason=timeout_executor_nao_configurado` e não executa); gera `correlation_id`; autoriza; grava e **confirma** a linha `authorization` com `correlation_id` e `timeout_ms`. Se não puder confirmar, **não chama o executor** e não há *fallback*;
+  - **M2:** chama o executor **com o mesmo timeout gravado** e impõe um **prazo rígido** (`ExecutorTimeout`), sem transação do `ActionLog` aberta. Um executor que ultrapassa o limite **não** é execução normal: M3 grava `result=unknown`, `error=ExecutorTimeout`; **não se assume que cancelar a espera desfaz o efeito externo**, e um resultado tardio é descartado (só log de aplicação);
+  - **M3:** nova transação independente grava `executed` com `result=ok|error|unknown`, `error` sanitizado e `duration_ms`. **`reason` preserva o motivo original da autorização**; o nome da exceção vai só em `error`.
+- Tradução (ADR-006 §7): autorização permitida → `decision=allowed`, `result=unknown` (inicial), `error` nulo; ok → `allowed`/`ok`; falha do executor → `allowed`/`error`/`error=<tipo>`; negada → `denied`, `result` e `error` nulos. Nenhum teste protegido muda: o gateway mantém em memória o `decision` `ok`/`error` atual.
+- Produz: `reconcile_unfinished(now: datetime) -> ReconcileResult`: acha `authorization`/`allowed` sem `executed` do mesmo `correlation_id` após `timeout_ms` **registrado em M1** + 2 min; grava `reconciled`/`allowed`/`unknown`; idempotente; **nunca reexecuta**. O agendamento periódico em `app/tasks.py` entra na Tarefa 3.6, junto com a limpeza de 15 min.
+- `TimedExecutor`: executor que aceita `timeout_ms`. Os timeouts ficam em `settings`, **nunca** em `registry.py`.
+- Persistência faz a tradução `AuditEntry` → linha (ADR-006 §7): `executed`/`ok` → `decision=allowed, result=ok`; `executed`/`error` → `decision=allowed, result=error`.
 
-- [ ] Testes que falham:
+- [ ] Testes que falham (PostgreSQL real, como `fa_app`; **substituem** `test_falha_no_executor_grava_erro_e_reverte_efeitos_locais`):
   - `test_chamada_permitida_grava_autorizacao_e_execucao`;
-  - `test_chamada_negada_grava_uma_linha`;
-  - `test_linha_nao_contem_payload`;
-  - `test_falha_no_executor_grava_erro_e_reverte_efeitos_locais`.
-- [ ] Implementar, ver passar, commit. Os 62 testes de `tests/actions/` continuam intactos.
+  - `test_negada_grava_uma_linha_e_nao_chama_executor`;
+  - `test_linha_nao_contem_payload_nem_retorno_do_executor`;
+  - `test_autorizacao_confirmada_antes_do_executor` (observada por **outra conexão**, dentro do executor falso);
+  - `test_nenhuma_transacao_do_actionlog_aberta_durante_o_executor`;
+  - `test_falha_no_executor_grava_erro_e_reverte_alteracoes_locais` (o chamador altera uma tabela de negócio; o executor falha; a alteração some e o registro de erro permanece);
+  - `test_falha_ao_gravar_autorizacao_nao_chama_executor` e `test_sem_actionlog_nao_ha_fallback_de_execucao`;
+  - `test_correlation_id_persistido_em_m1_antes_do_executor` e `test_linhas_da_mesma_chamada_compartilham_correlation_id`;
+  - `test_timeout_efetivo_registrado_em_m1_e_aplicado_ao_executor`;
+  - `test_executor_que_ultrapassa_o_timeout_nao_e_execucao_normal`, `test_timeout_nao_assume_que_cancelar_desfaz_efeitos`, `test_resultado_tardio_e_descartado_e_nao_altera_o_actionlog` e `test_timeout_rigido_nao_depende_da_cooperacao_do_executor`;
+  - `test_falha_do_executor_preserva_reason_da_autorizacao` e `test_autorizacao_permitida_comeca_com_result_unknown`;
+  - `test_acao_sem_timeout_grava_negacao_e_nao_chama_executor` e `test_executor_sem_timeout_configurado_e_recusado`;
+  - `test_queda_apos_autorizacao_deixa_linha_sem_conclusao`;
+  - `test_conciliacao_respeita_timeout_mais_2_minutos`;
+  - `test_conciliacao_usa_timeout_registrado_e_nao_a_configuracao_atual`;
+  - `test_conciliacao_nunca_reexecuta_e_unknown_e_terminal`;
+  - `test_conciliacao_e_idempotente`.
+- [ ] Implementar, ver passar, commit. Os testes existentes de `tests/actions/` (66 passando, 1 pulado) continuam **intactos e sem alteração**.
 
-**Concluída quando:** toda chamada ao gateway deixa rastro no banco.
+**Concluída quando:** toda chamada ao gateway deixa rastro no banco, com M1 comprovadamente confirmado antes do executor e o registro de erro sobrevivendo ao rollback do negócio.
 
 ### Tarefa 2.6: Admin e API base
 
@@ -325,10 +392,12 @@ Fases: 1 → 2 → 3 → 4, em sequência. Dentro de cada fase, as tarefas segue
   - `test_actions_api_somente_get`: POST, PUT, PATCH e DELETE → 405;
   - `test_admin_actionlog_somente_leitura`;
   - `test_profile_e_fee_schedules_get_patch`;
-  - `test_status_de_conformidade_exige_evidencia`.
+  - `test_status_de_conformidade_exige_evidencia`;
+  - `test_admin_e_api_nao_exibem_conteudo_expirado`: usam só o acesso `visible`; nenhum caminho do Admin ou da API consulta `unfiltered`;
+  - `test_api_nao_expoe_conteudo_expirado_por_relacao`.
 - [ ] Implementar, ver passar, commit.
 
-**Conclusão da Fase 2:** os modelos aplicam do zero; o `ActionLog` é *append-only* comprovado como `fa_app`; o gateway grava tudo; a API e o Admin funcionam com token.
+**Conclusão da Fase 2:** os modelos aplicam do zero; o `ActionLog` é *append-only* comprovado como `fa_app`, com cadeia de hashes v1 verificável, sem bifurcação; o gateway grava tudo em três momentos, com falha fechada; a conciliação marca `unknown` sem reexecutar; conteúdo expirado não aparece na API nem no Admin; a API e o Admin funcionam com token; nenhum executor, conector ou permissão novos.
 
 ---
 
