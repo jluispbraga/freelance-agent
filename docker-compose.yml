@@ -1,0 +1,98 @@
+# Segredos entram só por env_file (env/<serviço>.env), conforme docs/security/secrets-matrix.md.
+# Redes (design §5.2): `interna` não tem saída; só o web publica porta e só worker/bot saem.
+x-python: &python
+  build: .
+  image: freelance-agent:dev
+  user: "10001:10001"
+  environment:
+    TZ: America/Manaus
+  volumes:
+    - ./PROFILE.md:/app/PROFILE.md:ro
+
+services:
+  db:
+    image: postgres:17
+    env_file: env/db.env
+    environment:
+      TZ: America/Manaus
+      # Nome do banco (não é segredo): igual ao de toda DATABASE_URL em env/*.env.
+      POSTGRES_DB: freelance_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/db/init-roles.sql:/docker-entrypoint-initdb.d/init-roles.sql:ro
+    networks: [interna]
+    healthcheck:
+      # TCP: durante a inicialização a imagem só escuta no socket Unix.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d freelance_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    <<: *python
+    env_file: env/migrate.env
+    command: ["migrate"]
+    restart: "no"
+    networks: [interna]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    <<: *python
+    env_file: env/web.env
+    command: ["web", "--bind", "0.0.0.0:8000"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [interna, publica]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    <<: *python
+    env_file: env/worker.env
+    command: ["worker"]
+    restart: unless-stopped
+    networks: [interna, saida]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Os dois workers (filas llm e default) com heartbeat nos últimos 60 s.
+      test: ["CMD", "python", "-m", "app.main", "worker-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # O bot do Telegram chega na Fase 4; até lá só sobe com `docker compose --profile bot up`.
+  bot:
+    <<: *python
+    env_file: env/bot.env
+    command: ["bot"]
+    profiles: ["bot"]
+    networks: [interna, saida]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+networks:
+  interna:
+    internal: true
+  publica: {}
+  saida: {}
+
+volumes:
+  pgdata:
